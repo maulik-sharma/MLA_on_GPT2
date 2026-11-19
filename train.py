@@ -215,6 +215,10 @@ def train(mc: GPTConfig, tc: TrainConfig):
     if not tc.resume or not os.path.exists(log_path):
         with open(log_path, "w", newline="") as f:
             csv.writer(f).writerow(["iter", "train_loss", "val_loss", "lr"])
+    step_log_path = os.path.join(tc.out_dir, "train_log.csv")  # per-step training loss
+    if not tc.resume or not os.path.exists(step_log_path):
+        with open(step_log_path, "w", newline="") as f:
+            csv.writer(f).writerow(["iter", "loss", "lr"])
 
     # ---- training loop ----
     x, y = get_batch(tc.data_dir, "train", tc.batch_size, mc.block_size, tc.device)
@@ -264,9 +268,18 @@ def train(mc: GPTConfig, tc: TrainConfig):
             dt = time.time() - t0
             t0 = time.time()
             tok_s = tc.batch_size * tc.grad_accum_steps * mc.block_size * (tc.log_interval if it > start_iter else 1) / dt
-            print(f"iter {it}: loss {loss.item() * tc.grad_accum_steps:.4f}  lr {lr:.2e}  {tok_s:,.0f} tok/s")
+            step_loss = loss.item() * tc.grad_accum_steps
+            print(f"iter {it}: loss {step_loss:.4f}  lr {lr:.2e}  {tok_s:,.0f} tok/s")
+            with open(step_log_path, "a", newline="") as f:
+                csv.writer(f).writerow([it, f"{step_loss:.4f}", f"{lr:.2e}"])
 
     print(f"done. best val loss {best_val:.4f}; checkpoints in {tc.out_dir}/")
+    try:
+        from plot import plot_run
+        for p in plot_run(tc.out_dir):
+            print(f"saved plot {p}")
+    except Exception as e:  # plotting must never break a finished training run
+        print(f"could not create plots: {e}")
 
 
 # --------------------------------------------------------------------------------------
