@@ -141,7 +141,9 @@ python train.py --attn_type mha --out_dir out_mha  # standard attention baseline
 python train.py --resume                           # continue from out/ckpt_last.pt
 ```
 
-On each run the script reports the device, precision, parameter count, KV-cache size and tokens per iteration. Every `eval_interval` steps it estimates the training and validation loss, writes a checkpoint and prints a short generated sample.
+On each run the script reports the device, precision, parameter count, KV-cache size and tokens per iteration. A progress bar shows the current loss, learning rate, best validation loss and throughput. Every `eval_interval` steps the script estimates the training and validation loss, writes a checkpoint and prints a short generated sample.
+
+Training stops early when the validation loss has not improved by at least `min_delta` for `patience` consecutive evaluations. `ckpt_best.pt` always holds the model with the lowest validation loss. Loss plots are written to `plots/` when training ends.
 
 ### 3. Generate text
 
@@ -216,6 +218,13 @@ python train.py --attn_type mha --out_dir out_mha
 | `--grad_clip` | `1.0` | Gradient norm clipping threshold (`0` disables clipping) |
 
 The effective batch size in tokens is `batch_size * grad_accum_steps * block_size`.
+
+### train.py: early stopping options
+
+| Option | Default | Description |
+|---|---|---|
+| `--patience` | `5` | Stop after this many consecutive evaluations without improvement (`0` disables early stopping) |
+| `--min_delta` | `0.001` | Minimum decrease in validation loss that counts as an improvement |
 
 ### train.py: logging and checkpointing options
 

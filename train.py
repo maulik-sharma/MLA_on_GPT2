@@ -22,6 +22,7 @@ from dataclasses import dataclass, asdict, fields
 
 import numpy as np
 import torch
+from tqdm import tqdm
 
 from model import GPT, GPTConfig
 
@@ -53,6 +54,9 @@ class TrainConfig:
     beta1: float = 0.9
     beta2: float = 0.95
     grad_clip: float = 1.0
+    # early stopping
+    patience: int = 5             # stop after this many evals without val improvement (0 = off)
+    min_delta: float = 0.001      # a val loss drop smaller than this does not count as improvement
     # system
     device: str = "auto"          # auto / cuda / mps / cpu
     dtype: str = "auto"           # auto / bfloat16 / float16 / float32
@@ -157,11 +161,11 @@ def estimate_loss(model, tc, mc, device, ctx):
     return out
 
 
-def save_checkpoint(path, model, optimizer, mc, tc, it, best_val):
+def save_checkpoint(path, model, optimizer, mc, tc, it, best_val, bad_evals=0):
     raw = model._orig_mod if hasattr(model, "_orig_mod") else model
     torch.save({"model": raw.state_dict(), "optimizer": optimizer.state_dict(),
                 "model_config": asdict(mc), "train_config": asdict(tc),
-                "iter": it, "best_val_loss": best_val}, path)
+                "iter": it, "best_val_loss": best_val, "bad_evals": bad_evals}, path)
 
 
 def train(mc: GPTConfig, tc: TrainConfig):
@@ -183,12 +187,13 @@ def train(mc: GPTConfig, tc: TrainConfig):
             raise SystemExit(f"{tc.data_dir}/{s}.bin not found -- run `python train.py --prepare` first.")
 
     # ---- model / optimizer (fresh or resumed) ----
-    start_iter, best_val = 0, float("inf")
+    start_iter, best_val, bad_evals = 0, float("inf"), 0
     ckpt_path = os.path.join(tc.out_dir, "ckpt_last.pt")
     if tc.resume:
         model, ckpt = GPT.from_checkpoint(ckpt_path, tc.device)
         mc = model.config
         start_iter, best_val = ckpt["iter"] + 1, ckpt["best_val_loss"]
+        bad_evals = ckpt.get("bad_evals", 0)
         print(f"resumed from {ckpt_path} at iter {ckpt['iter']} (best val {best_val:.4f})")
     else:
         model = GPT(mc).to(tc.device)
@@ -221,32 +226,47 @@ def train(mc: GPTConfig, tc: TrainConfig):
             csv.writer(f).writerow(["iter", "loss", "lr"])
 
     # ---- training loop ----
+    log = tqdm.write  # print without breaking the progress bar
+    tokens_per_iter = tc.batch_size * tc.grad_accum_steps * mc.block_size
+    pbar = tqdm(total=tc.max_iters, initial=start_iter, desc=f"train {mc.attn_type}", unit="it", dynamic_ncols=True)
     x, y = get_batch(tc.data_dir, "train", tc.batch_size, mc.block_size, tc.device)
     t0 = time.time()
+    stopped_early = False
     for it in range(start_iter, tc.max_iters + 1):
         lr = get_lr(it, tc)
         for g in optimizer.param_groups:
             g["lr"] = lr
 
-        # evaluation + checkpointing
+        # evaluation, checkpointing and early stopping
         if it % tc.eval_interval == 0 and (it > start_iter or not tc.resume):
             losses = estimate_loss(model, tc, mc, tc.device, ctx)
-            print(f"[eval] iter {it}: train {losses['train']:.4f}  val {losses['val']:.4f}")
             with open(log_path, "a", newline="") as f:
                 csv.writer(f).writerow([it, f"{losses['train']:.4f}", f"{losses['val']:.4f}", f"{lr:.2e}"])
+            improved = losses["val"] < best_val - tc.min_delta
+            bad_evals = 0 if improved else bad_evals + 1
+            msg = f"[eval] iter {it}: train {losses['train']:.4f}  val {losses['val']:.4f}"
+            if losses["val"] < best_val:
+                best_val = losses["val"]
+                if it > 0:
+                    save_checkpoint(os.path.join(tc.out_dir, "ckpt_best.pt"), model, optimizer, mc, tc, it, best_val, bad_evals)
+                    msg += "  (new best, saved)"
+            if not improved and tc.patience:
+                msg += f"  (no significant improvement {bad_evals}/{tc.patience})"
+            log(msg)
             if it > 0:
-                save_checkpoint(ckpt_path, model, optimizer, mc, tc, it, min(best_val, losses["val"]))
-                if losses["val"] < best_val:
-                    best_val = losses["val"]
-                    save_checkpoint(os.path.join(tc.out_dir, "ckpt_best.pt"), model, optimizer, mc, tc, it, best_val)
-                    print(f"  saved new best checkpoint (val {best_val:.4f})")
+                save_checkpoint(ckpt_path, model, optimizer, mc, tc, it, best_val, bad_evals)
             if tc.sample_tokens:
                 raw_model.eval()
                 start = torch.tensor([[enc.eot_token]], device=tc.device)
                 with ctx:
                     out = raw_model.generate(start, tc.sample_tokens, temperature=0.8, top_k=50)
-                print("  sample:", repr(enc.decode(out[0, 1:].tolist())))
+                log("  sample: " + repr(enc.decode(out[0, 1:].tolist())))
                 raw_model.train()
+            if tc.patience and bad_evals >= tc.patience:
+                log(f"early stopping at iter {it}: val loss has not improved by {tc.min_delta} "
+                    f"for {tc.patience} evaluations ({tc.patience * tc.eval_interval} iterations)")
+                stopped_early = True
+                break
         if it == tc.max_iters:
             break
 
@@ -263,17 +283,20 @@ def train(mc: GPTConfig, tc: TrainConfig):
         scaler.step(optimizer)
         scaler.update()
         optimizer.zero_grad(set_to_none=True)
+        pbar.update(1)
 
         if it % tc.log_interval == 0:
             dt = time.time() - t0
             t0 = time.time()
-            tok_s = tc.batch_size * tc.grad_accum_steps * mc.block_size * (tc.log_interval if it > start_iter else 1) / dt
+            tok_s = tokens_per_iter * (tc.log_interval if it > start_iter else 1) / dt
             step_loss = loss.item() * tc.grad_accum_steps
-            print(f"iter {it}: loss {step_loss:.4f}  lr {lr:.2e}  {tok_s:,.0f} tok/s")
+            pbar.set_postfix(loss=f"{step_loss:.4f}", lr=f"{lr:.2e}", best_val=f"{best_val:.4f}", tok_s=f"{tok_s:,.0f}")
             with open(step_log_path, "a", newline="") as f:
                 csv.writer(f).writerow([it, f"{step_loss:.4f}", f"{lr:.2e}"])
+    pbar.close()
 
-    print(f"done. best val loss {best_val:.4f}; checkpoints in {tc.out_dir}/")
+    print(f"{'stopped early' if stopped_early else 'done'}. best val loss {best_val:.4f}; "
+          f"best model in {tc.out_dir}/ckpt_best.pt")
     try:
         from plot import plot_run
         for p in plot_run(tc.out_dir):
