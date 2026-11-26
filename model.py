@@ -326,8 +326,12 @@ class GPT(nn.Module):
         return caches[0][0].size(1) if self.config.attn_type == "mla" else caches[0][0].size(2)
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, use_cache=True):
-        """Autoregressive sampling. With use_cache=True only the new token is processed each step."""
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, use_cache=True, on_step=None):
+        """
+        Autoregressive sampling. With use_cache=True only the new token is processed each step.
+        on_step: optional callback, called as on_step(caches) after every forward pass
+        (caches is None when use_cache=False). Used by generate.py to measure the KV-cache.
+        """
         bs = self.config.block_size
         caches = None
         for _ in range(max_new_tokens):
@@ -340,6 +344,8 @@ class GPT(nn.Module):
                     logits, _, caches = self(idx[:, -(bs // 2 if idx.size(1) >= bs else bs):])
                 else:
                     logits, _, caches = self(idx[:, -1:], caches=caches)
+            if on_step is not None:
+                on_step(caches)
             logits = logits[:, -1, :] / max(temperature, 1e-5)
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
@@ -355,6 +361,13 @@ class GPT(nn.Module):
         if c.attn_type == "mla":
             return c.n_layer * (c.kv_lora_rank + c.qk_rope_head_dim)
         return c.n_layer * 2 * c.n_embd
+
+    @staticmethod
+    def kv_cache_bytes(caches):
+        """Actual memory held by a set of per-layer KV-caches (as returned by forward())."""
+        if caches is None:
+            return 0
+        return sum(t.numel() * t.element_size() for layer in caches for t in layer)
 
     def mha_equivalent_kv_cache_elems_per_token(self):
         """Cache size of a standard GPT-2 MHA model with the same n_layer / n_embd."""

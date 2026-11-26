@@ -151,6 +151,12 @@ Training stops early when the validation loss has not improved by at least `min_
 python generate.py --ckpt out/ckpt_best.pt --prompt "The history of the internet" --max_new_tokens 200
 ```
 
+If `--ckpt` is not given and both `out_mla/ckpt_best.pt` and `out_mha/ckpt_best.pt` exist, the script generates from both models with the same prompt and seed. It then prints a table comparing the KV-cache memory of the two models during inference and saves `plots/kv_cache_comparison.png`:
+
+```bash
+python generate.py --prompt "The history of the internet" --max_new_tokens 300 --seed 1
+```
+
 ### 4. Comparing MLA and MHA
 
 Train both variants with identical training settings and separate output directories, then compare the `log.csv` files:
@@ -249,7 +255,9 @@ The effective batch size in tokens is `batch_size * grad_accum_steps * block_siz
 
 | Option | Default | Description |
 |---|---|---|
-| `--ckpt` | `out/ckpt_best.pt` | Checkpoint to load |
+| `--ckpt` | none | Generate from this checkpoint only. Without it, both `--mla_ckpt` and `--mha_ckpt` are used if they exist (compare mode); otherwise `out/ckpt_best.pt` is used. |
+| `--mla_ckpt` | `out_mla/ckpt_best.pt` | MLA checkpoint for compare mode |
+| `--mha_ckpt` | `out_mha/ckpt_best.pt` | MHA checkpoint for compare mode |
 | `--prompt` | empty | Prompt text. If empty, generation starts from an end-of-text token. |
 | `--num_samples` | `1` | Number of independent samples |
 | `--max_new_tokens` | `200` | Tokens to generate per sample |
@@ -257,7 +265,9 @@ The effective batch size in tokens is `batch_size * grad_accum_steps * block_siz
 | `--top_k` | `50` | Restrict sampling to the k most likely tokens |
 | `--no_cache` | off | Disable the KV-cache and recompute the full context each step |
 | `--device` | `cuda` if available | Device to run on |
-| `--seed` | none | Random seed for reproducible samples |
+| `--seed` | none | Random seed for reproducible samples. In compare mode both models use the same seed. |
+| `--plot` | `plots/kv_cache_comparison.png` | Where to save the KV-cache comparison plot |
+| `--no_plot` | off | Do not save the comparison plot |
 
 During generation, the model keeps the cached latents and processes only the newest token at each step. When the cache reaches `block_size`, it is rebuilt from the most recent `block_size / 2` tokens, and generation continues on this sliding window.
 
